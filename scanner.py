@@ -71,10 +71,13 @@ class Ctx:
     session: requests.Session
     delay: float
     verbose: bool
+    workers: int = 10
     findings: list[Finding] = field(default_factory=list)
+    _lock: object = field(default_factory=lambda: __import__("threading").Lock())
 
     def get(self, url: str, **kw):
-        time.sleep(self.delay)
+        if self.delay:
+            time.sleep(self.delay)
         kw.setdefault("timeout", TIMEOUT)
         kw.setdefault("allow_redirects", True)
         try:
@@ -88,7 +91,8 @@ class Ctx:
             return None
 
     def post(self, url: str, **kw):
-        time.sleep(self.delay)
+        if self.delay:
+            time.sleep(self.delay)
         kw.setdefault("timeout", TIMEOUT)
         try:
             r = self.session.post(url, **kw)
@@ -100,10 +104,18 @@ class Ctx:
                 print(f"    POST ERR {url}  ({e})")
             return None
 
+    def fanout(self, urls, fn):
+        """Fetch many URLs concurrently and call fn(url, response) for each."""
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futs = {ex.submit(self.get, u): u for u in urls}
+            for fut in cf.as_completed(futs):
+                fn(futs[fut], fut.result())
+
     def add(self, f: Finding):
-        self.findings.append(f)
-        print(f"  [{f.severity:<6}] {f.module:<9} {f.title}"
-              + (f"  -> {f.url}" if f.url else ""))
+        with self._lock:
+            self.findings.append(f)
+            print(f"  [{f.severity:<6}] {f.module:<9} {f.title}"
+                  + (f"  -> {f.url}" if f.url else ""))
 
 
 def make_session() -> requests.Session:
@@ -145,25 +157,25 @@ WEBSHELL_SIGS = [
 
 
 def mod_webshell(ctx: Ctx, base: str):
-    for p in WEBSHELL_PATHS:
-        url = urljoin(base + "/", p)
-        r = ctx.get(url)
+    urls = [urljoin(base + "/", p) for p in WEBSHELL_PATHS]
+
+    def handle(url, r):
         if not r or r.status_code != 200 or not r.text:
-            continue
+            return
         for rx, label in WEBSHELL_SIGS:
             m = rx.search(r.text)
             if m:
                 ctx.add(Finding(base, "webshell", SEV_HIGH,
                                 f"Possible planted webshell ({label})",
                                 url, m.group(0)[:120]))
-                break
-        else:
-            # a 200 on a classic shell name with a form is at least suspicious
-            if re.search(r"<form[^>]*method=['\"]?post", r.text, re.I) \
-                    and len(r.text) < 60000:
-                ctx.add(Finding(base, "webshell", SEV_MED,
-                                "Suspicious PHP file responds with a POST form",
-                                url, f"{len(r.text)} bytes"))
+                return
+        if re.search(r"<form[^>]*method=['\"]?post", r.text, re.I) \
+                and len(r.text) < 60000:
+            ctx.add(Finding(base, "webshell", SEV_MED,
+                            "Suspicious PHP file responds with a POST form",
+                            url, f"{len(r.text)} bytes"))
+
+    ctx.fanout(urls, handle)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,8 +194,10 @@ def upload_variants(tok: str):
         ("poc.php.jpg", "image/jpeg", marker),             # double ext (reverse)
         ("poc.jpg.php", "image/jpeg", marker),             # double ext
         ("poc.phtml", "image/jpeg", marker),               # alt php ext
+        ("poc.pht", "image/jpeg", marker),                 # alt php ext (older Debian)
         ("poc.php5", "image/jpeg", marker),
-        ("poc.phar", "image/jpeg", marker),
+        ("poc.php7", "image/jpeg", marker),
+        ("poc.phar", "image/jpeg", marker),                # mapped to PHP in some setups
         ("poc.php%00.jpg", "image/jpeg", marker),          # legacy null byte
         ("poc.jpg", "image/jpeg", "\xff\xd8\xff\xe0" + marker),  # magic bytes + php
         ("poc.jpg", "image/jpeg", plain),                  # control: plain text
@@ -258,25 +272,60 @@ LFI_PAYLOADS = [
     "php://filter/convert.base64-encode/resource=index.php",
 ]
 
+# Session file paths — relevant to the session.upload_progress → LFI chain.
+# Reading one of these via LFI is the primitive that chain depends on.
+SESSION_PATHS = [
+    "/var/lib/php/sessions/",
+    "/tmp/",
+    "/var/lib/php5/",
+    "/var/lib/php7/",
+    "/var/lib/php8/",
+]
+
 PASSWD_RX = re.compile(r"root:.*:0:0:")
 B64_PHP_RX = re.compile(r"PD9waHA|PCFET0NUWVBF")  # base64 of "<?php" / "<!DOCTYP"
 
 
 def mod_lfi(ctx: Ctx, base: str):
-    for param in LFI_PARAMS:
-        for payload in LFI_PAYLOADS:
-            url = f"{base}/?{param}={payload}"
-            r = ctx.get(url)
-            if not r or not r.text:
-                continue
-            if PASSWD_RX.search(r.text):
-                ctx.add(Finding(base, "lfi", SEV_HIGH,
-                                f"LFI: /etc/passwd via ?{param}=",
-                                url, "root:...:0:0:"))
-            elif "php://filter" in payload and B64_PHP_RX.search(r.text):
-                ctx.add(Finding(base, "lfi", SEV_HIGH,
-                                f"LFI: php://filter leaks PHP source via ?{param}=",
-                                url, "base64 of PHP returned"))
+    hit_params: set[str] = set()
+    url_map = {f"{base}/?{p}={pl}": (p, pl)
+               for p in LFI_PARAMS for pl in LFI_PAYLOADS}
+
+    def handle(url, r):
+        if not r or not r.text:
+            return
+        param, payload = url_map[url]
+        if PASSWD_RX.search(r.text):
+            ctx.add(Finding(base, "lfi", SEV_HIGH,
+                            f"LFI: /etc/passwd via ?{param}=",
+                            url, "root:...:0:0:"))
+            hit_params.add(param)
+        elif "php://filter" in payload and B64_PHP_RX.search(r.text):
+            ctx.add(Finding(base, "lfi", SEV_HIGH,
+                            f"LFI: php://filter leaks PHP source via ?{param}=",
+                            url, "base64 of PHP returned"))
+            hit_params.add(param)
+
+    ctx.fanout(list(url_map), handle)
+
+    # Session-file probe fires only if a basic LFI already landed. Primitive
+    # for the session.upload_progress → RCE chain.
+    if not hit_params:
+        return
+    session_urls = [f"{base}/?{param}={sdir}sess_probe"
+                    for param in hit_params for sdir in SESSION_PATHS]
+
+    def handle_sess(url, r):
+        if not r or r.status_code != 200 or len(r.text or "") >= 50000:
+            return
+        body = r.text or ""
+        if "php" in body.lower() or "upload_progress" in body:
+            ctx.add(Finding(base, "lfi", SEV_HIGH,
+                            "Session file reachable via LFI "
+                            "(session.upload_progress → RCE chain primitive)",
+                            url, "common session dir"))
+
+    ctx.fanout(session_urls, handle_sess)
 
 
 # --------------------------------------------------------------------------- #
@@ -307,41 +356,119 @@ PHP_VER_HDR = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 EOL_BRANCHES = {(5, x) for x in range(7)} | {(7, x) for x in range(5)} \
     | {(8, 0), (8, 1)}
 
+# Known-vulnerable PHP version ceilings (fixed in these, so < = vulnerable).
+# CVE-2024-4577: PHP-CGI Windows argument injection (Best-Fit bypass of CVE-2012-1823)
+CVE_2024_4577_FIXED = {(8, 1): 29, (8, 2): 20, (8, 3): 8}
+# CVE-2019-11043: PHP-FPM nginx underflow
+CVE_2019_11043_FIXED = {(7, 1): 33, (7, 2): 24, (7, 3): 11}
+# "php2shell 2026" session.upload_progress claim from jackalsyn.com — the CVE
+# IDs listed on that page (CVE-2026-109618 / 109619) do NOT match NVD numbering
+# and are not corroborated by any upstream advisory I can verify. Treated as
+# page-reported-unverified; included so coverage follows the user-supplied
+# source material.
+JACKALSYN_FIXED = {(8, 2): 34, (8, 3): 35, (8, 4): 26, (8, 5): 11}
+
+# IOC: lab-marker string the page's PoC embeds in multipart boundaries.
+JACKALSYN_IOC = "UctxPoc2026"
+
+# Known RCE endpoints to probe (path-only, no exploit payload sent).
+KNOWN_RCE_PATHS = {
+    # CVE-2017-9841 — PHPUnit eval-stdin.php left in vendor dir
+    "vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php":
+        ("PHPUnit eval-stdin.php exposed (CVE-2017-9841)", SEV_HIGH, "<?php"),
+    "vendor/phpunit/phpunit/Util/PHP/eval-stdin.php":
+        ("PHPUnit eval-stdin.php exposed (CVE-2017-9841)", SEV_HIGH, "<?php"),
+    # CVE-2021-3129 — Laravel Ignition in debug mode
+    "_ignition/execute-solution":
+        ("Laravel Ignition endpoint reachable (CVE-2021-3129 if debug=on)",
+         SEV_HIGH, "ignition"),
+    "_ignition/health-check":
+        ("Laravel Ignition health-check reachable",
+         SEV_MED, "ignition"),
+    # ThinkPHP ~5.0 RCE — endpoint presence only, no payload
+    "index.php?s=/Index/\\think\\app/invokefunction":
+        ("ThinkPHP invokefunction endpoint reachable (RCE class)",
+         SEV_HIGH, "ThinkPHP"),
+}
+
 
 def mod_exposure(ctx: Ctx, base: str):
-    for p, (title, sev) in EXPOSURE_PATHS.items():
-        url = urljoin(base + "/", p)
-        r = ctx.get(url)
+    exposure_urls = {urljoin(base + "/", p): p for p in EXPOSURE_PATHS}
+
+    def handle_exp(url, r):
         if not r or r.status_code != 200 or not r.text:
-            continue
+            return
+        p = exposure_urls[url]
+        title, sev = EXPOSURE_PATHS[p]
         body = r.text
         if p in ("phpinfo.php", "info.php") and not PHPINFO_RX.search(body):
-            continue  # a generic 200 isn't a real phpinfo
+            return
         if p == ".env" and "=" not in body:
-            continue
+            return
         if p == ".git/config" and "[core]" not in body:
-            continue
+            return
         ctx.add(Finding(base, "exposure", sev, title, url,
                         body.strip().splitlines()[0][:100] if body.strip() else ""))
 
-    # version / header hygiene (the one verifiable idea worth keeping from the
-    # referenced write-up: old PHP + session.upload_progress surface area)
+    ctx.fanout(list(exposure_urls), handle_exp)
+
+    # known-RCE path probes (no exploit payload, just presence detection)
+    rce_urls = {urljoin(base + "/", p): p for p in KNOWN_RCE_PATHS}
+
+    def handle_rce(url, r):
+        if not r or r.status_code not in (200, 405, 500):
+            return
+        p = rce_urls[url]
+        title, sev, needle = KNOWN_RCE_PATHS[p]
+        if needle.lower() in (r.text or "").lower() or r.status_code == 405:
+            ctx.add(Finding(base, "exposure", sev, title, url,
+                            f"HTTP {r.status_code}"))
+
+    ctx.fanout(list(rce_urls), handle_rce)
+
+    # version / header hygiene — folds in CVE-2024-4577 (Windows CGI) and
+    # CVE-2019-11043 (nginx + PHP-FPM) banner-level detection
     r = ctx.get(base + "/")
     if r:
-        hdr = r.headers.get("X-Powered-By", "") + " " + r.headers.get("Server", "")
+        server_hdr = r.headers.get("Server", "")
+        powered_hdr = r.headers.get("X-Powered-By", "")
+        hdr = powered_hdr + " " + server_hdr
         m = PHP_VER_HDR.search(hdr)
         if m:
             major, minor, patch = map(int, m.groups())
+            branch = (major, minor)
             note = f"PHP {major}.{minor}.{patch} advertised in headers"
-            if (major, minor) in EOL_BRANCHES:
+            if branch in EOL_BRANCHES:
                 ctx.add(Finding(base, "exposure", SEV_MED,
                                 f"End-of-life PHP branch ({major}.{minor})",
                                 base, note + " — no security fixes"))
             else:
                 ctx.add(Finding(base, "exposure", SEV_INFO,
                                 "PHP version disclosed in headers", base, note))
+            # CVE-2024-4577: Windows + PHP-CGI + vulnerable branch
+            fixed_patch = CVE_2024_4577_FIXED.get(branch)
+            windows_hint = ("microsoft-iis" in server_hdr.lower()
+                            or "win" in server_hdr.lower())
+            if fixed_patch is not None and patch < fixed_patch and windows_hint:
+                ctx.add(Finding(base, "exposure", SEV_HIGH,
+                                "CVE-2024-4577 candidate: vulnerable PHP + Windows",
+                                base,
+                                f"{note}; fixed in {branch[0]}.{branch[1]}.{fixed_patch}"))
+            elif fixed_patch is not None and patch < fixed_patch:
+                ctx.add(Finding(base, "exposure", SEV_LOW,
+                                "CVE-2024-4577 patch missing (only exploitable on Windows CGI)",
+                                base, note))
+            # CVE-2019-11043: nginx + PHP-FPM vulnerable branch
+            fpm_fixed = CVE_2019_11043_FIXED.get(branch)
+            nginx_hint = "nginx" in server_hdr.lower()
+            if fpm_fixed is not None and patch < fpm_fixed and nginx_hint:
+                ctx.add(Finding(base, "exposure", SEV_HIGH,
+                                "CVE-2019-11043 candidate: vulnerable PHP + nginx",
+                                base,
+                                f"{note}; fixed in {branch[0]}.{branch[1]}.{fpm_fixed}; "
+                                "check nginx config for fastcgi_split_path_info"))
             ctx.add(Finding(base, "exposure", SEV_INFO,
-                            "Check session.upload_progress.enabled on this host",
+                            "Check session.upload_progress on this host",
                             base, "php -i | grep upload_progress  (disable if unused)"))
 
 
@@ -349,10 +476,114 @@ def mod_exposure(ctx: Ctx, base: str):
 # driver
 # --------------------------------------------------------------------------- #
 
+def mod_php2shell(ctx: Ctx, base: str):
+    """
+    Coverage for the 'php2shell 2026' attack-surface claim (jackalsyn.com),
+    all non-destructive:
+
+      1. Behavioural probe for session.upload_progress handler being enabled
+         (a benign multipart POST + PHP_SESSION_UPLOAD_PROGRESS -> PHPSESSID
+         set in Set-Cookie).
+      2. Severity escalation when banner suggests Apache prefork + mod_php
+         (the only SAPI the page reports as affected).
+      3. Version-ceiling check against the page's claimed "fixed in" releases
+         (8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). PHP 7.x is flagged permanently
+         vulnerable per the page.
+      4. IOC scan for the lab marker 'UctxPoc2026' in response bodies.
+
+    What this module intentionally does NOT do:
+      * Send oversized multipart POSTs or boundary-crafted requests designed
+        to trigger memory exhaustion / SIGSEGV. That is a DoS probe at your
+        live PHP, and the page itself contradicts whether that path yields
+        code execution. Disable the handler as the page recommends; this
+        scanner confirms whether disabling is needed, not whether a crash
+        can be induced.
+      * Fetch or run the 'PoC bundle' linked on that page.
+    """
+    tok = token(10)
+    sid = token(26)
+    headers = {"Cookie": f"PHPSESSID={sid}"}
+    data = {"PHP_SESSION_UPLOAD_PROGRESS": f"probe-{tok}"}
+    files = {"f": ("probe.txt", f"benign-{tok}".encode(), "text/plain")}
+    r = ctx.post(base + "/", headers=headers, data=data, files=files)
+    if not r:
+        return
+
+    server_hdr = r.headers.get("Server", "")
+    powered_hdr = r.headers.get("X-Powered-By", "")
+    body = r.text or ""
+
+    # (1) handler-enabled behavioural tell
+    saw_phpsessid = "PHPSESSID=" in r.headers.get("Set-Cookie", "")
+
+    # (2) SAPI inference — mod_php on Apache (prefork or otherwise) is the
+    # only SAPI the page reports as affected. FPM / CGI / nginx are reported
+    # unaffected. We can only guess from headers.
+    looks_apache = "apache" in server_hdr.lower()
+    looks_nginx = "nginx" in server_hdr.lower()
+    looks_php = "php" in powered_hdr.lower() or "php" in server_hdr.lower()
+    sapi_note = ""
+    if looks_apache and looks_php:
+        sapi_note = "Apache + PHP in headers — mod_php/prefork plausible"
+    elif looks_nginx:
+        sapi_note = "nginx in Server header — likely FPM (page reports unaffected)"
+
+    if saw_phpsessid:
+        sev = SEV_HIGH if looks_apache and looks_php else SEV_MED
+        ctx.add(Finding(base, "php2shell", sev,
+                        "session.upload_progress handler appears enabled "
+                        "(benign multipart POST triggered a PHPSESSID)",
+                        base,
+                        f"disable with session.upload_progress.enabled = Off"
+                        + (f"; {sapi_note}" if sapi_note else "")))
+
+    # (3) version-ceiling check against the page's claimed fixed releases
+    m = PHP_VER_HDR.search(powered_hdr + " " + server_hdr)
+    if m:
+        major, minor, patch = map(int, m.groups())
+        branch = (major, minor)
+        if major == 7:
+            ctx.add(Finding(base, "php2shell", SEV_HIGH,
+                            "PHP 7.x: page claims no fix will ship for this branch",
+                            base,
+                            f"advertised PHP {major}.{minor}.{patch}; "
+                            "page-reported, unverified"))
+        else:
+            fixed = JACKALSYN_FIXED.get(branch)
+            if fixed is not None and patch < fixed:
+                esc = SEV_HIGH if looks_apache and looks_php else SEV_MED
+                ctx.add(Finding(base, "php2shell", esc,
+                                f"PHP {branch[0]}.{branch[1]}.{patch} < "
+                                f"page-reported fix {branch[0]}.{branch[1]}.{fixed}",
+                                base,
+                                "CVE IDs from the source page do not match NVD "
+                                "numbering; treat as page-reported, unverified"
+                                + (f"; {sapi_note}" if sapi_note else "")))
+
+    # (4) IOC — if someone already ran that public PoC at this host, the lab
+    # marker often shows up echoed in error pages / debug output / logs that
+    # get served back.
+    if JACKALSYN_IOC in body:
+        ctx.add(Finding(base, "php2shell", SEV_HIGH,
+                        f"IOC: lab-marker '{JACKALSYN_IOC}' appears in response "
+                        "(indicates the public PoC was fired at this host)",
+                        base, body[:120]))
+
+    # Advisory: things only visible server-side
+    ctx.add(Finding(base, "php2shell", SEV_INFO,
+                    "Server-side checks the scanner can't do over HTTP",
+                    base,
+                    "grep PHP error log for 'Allowed memory size ... exhausted' "
+                    "and 'open(... sess_...) failed'; watch for SIGSEGV in Apache "
+                    "children; consider WAF rate-limit on multipart POSTs to "
+                    "endpoints that don't take uploads"))
+
+
 MODULES: dict[str, Callable] = {
     "webshell": mod_webshell,
     "lfi": mod_lfi,
     "exposure": mod_exposure,
+    "php2shell": mod_php2shell,
 }
 
 
@@ -386,7 +617,12 @@ def main():
     ap = argparse.ArgumentParser(description="Authorized php2shell PoC scanner")
     ap.add_argument("targets", nargs="+", help="base URLs you own, e.g. https://interdo.me")
     ap.add_argument("--only", help="comma list: webshell,uploads,lfi,exposure")
-    ap.add_argument("--delay", type=float, default=0.4, help="seconds between requests")
+    ap.add_argument("--delay", type=float, default=0.0,
+                    help="per-request sleep (default 0; raise if the server protests)")
+    ap.add_argument("--workers", type=int, default=10,
+                    help="concurrent requests per module (default 10)")
+    ap.add_argument("--target-workers", type=int, default=4,
+                    help="concurrent targets scanned at once (default 4)")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verify (self-signed)")
     # upload module (opt-in)
@@ -406,11 +642,29 @@ def main():
         upload_cfg = {"url": args.upload_url, "field": args.upload_field,
                       "extra": parse_extra(args.upload_extra)}
 
-    ctx = Ctx(session=sess, delay=args.delay, verbose=args.verbose)
+    # Give the pooled session enough connections for the concurrency we want.
+    for prefix in ("https://", "http://"):
+        adapter = HTTPAdapter(pool_connections=args.workers * 2,
+                              pool_maxsize=args.workers * 2,
+                              max_retries=Retry(total=2, backoff_factor=0.3,
+                                                status_forcelist=(502, 503, 504),
+                                                allowed_methods=False))
+        sess.mount(prefix, adapter)
 
-    print("php2shell-scan — authorized self-test only.")
-    for t in args.targets:
-        scan_target(ctx, t, only, upload_cfg)
+    ctx = Ctx(session=sess, delay=args.delay, verbose=args.verbose,
+              workers=args.workers)
+
+    print(f"php2shell-scan — authorized self-test only "
+          f"(workers={args.workers}, targets={args.target_workers}).")
+    t0 = time.time()
+    if args.target_workers > 1 and len(args.targets) > 1:
+        with cf.ThreadPoolExecutor(max_workers=args.target_workers) as ex:
+            list(ex.map(lambda t: scan_target(ctx, t, only, upload_cfg),
+                        args.targets))
+    else:
+        for t in args.targets:
+            scan_target(ctx, t, only, upload_cfg)
+    print(f"\n({time.time()-t0:.1f}s elapsed)")
 
     # report
     print("\n" + "=" * 60)
